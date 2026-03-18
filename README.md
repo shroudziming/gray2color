@@ -6,7 +6,7 @@
 
 - 数据集读取：按文件名配对读取 `gray/` 与 `color/`（取交集）
 - 训练：保存 `outputs/unet_last.pt`、`outputs/unet_best.pt`、训练曲线与每个 epoch 的预测网格图
-- 评估：输出 MAE(L1) 与 PSNR，并保存 `outputs/predictions.png`
+- 评估：输出 MAE(L1) 与 PSNR，并保存预测效果 `outputs/predictions.png`
 - 一键流程：训练 + 评估（见 `run_pipeline.py`）
 
 ## 目录约定（数据）
@@ -26,7 +26,7 @@
 - `color/` 与 `gray/` 下的图片文件名需要一一对应（数据加载时以“共同文件名”配对）
 - 仅识别扩展名：`.jpg/.jpeg/.png`
 
-## 数据来源（务必保留）
+## 数据来源
 
 本项目使用的示例数据集来自 Kaggle：
 
@@ -34,14 +34,15 @@
 - Kaggle ID：`theblackmamba31/landscape-image-colorization`
 - 链接：https://www.kaggle.com/datasets/theblackmamba31/landscape-image-colorization
 
-仓库内提供了下载脚本（使用 `kagglehub`）：
+数据下载脚本（使用 `kagglehub`）：
 
-```bash
-pip install kagglehub
-python input/download.py
+```python
+import kagglehub
+
+path = kagglehub.dataset_download("theblackmamba31/landscape-image-colorization")
+
+print("Path to dataset files:", path)
 ```
-
-`input/download.py` 会打印下载到本机缓存的路径。你需要将其中的 `landscape Images/` 目录复制/解压到本仓库的 `input/` 下，确保最终目录结构满足上一节的约定。
 
 请遵守 Kaggle 及该数据集页面中给出的许可协议与使用条款；如用于课程作业/报告，建议在报告与仓库文档中同时保留上述来源信息。
 
