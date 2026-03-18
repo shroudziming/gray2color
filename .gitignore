@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# local artifacts
+outputs/
+*.pt
+*.pth
+*.onnx
+
+# venv
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
