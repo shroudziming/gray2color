@@ -63,9 +63,9 @@ pip install torch numpy pillow matplotlib tqdm
 ### 1) 一键训练 + 评估
 
 ```bash
-python -m mygray2color.run_pipeline quick
+python -m run_pipeline quick
 # 或
-python -m mygray2color.run_pipeline full
+python -m run_pipeline full
 ```
 
 - `quick`：更少 epoch/图片数，适合验证环境与流程
@@ -74,13 +74,13 @@ python -m mygray2color.run_pipeline full
 ### 2) 仅训练
 
 ```bash
-python -m mygray2color.train
+python -m train
 ```
 
 ### 3) 仅评估（需要已有 checkpoint）
 
 ```bash
-python -m mygray2color.eval
+python -m eval
 ```
 
 ## 输出文件
