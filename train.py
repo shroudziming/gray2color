@@ -6,6 +6,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.optim import Adam
 from tqdm import tqdm
@@ -13,7 +14,7 @@ from tqdm import tqdm
 from .data import DatasetConfig, LandscapeColorizationDataset, make_loaders
 from .paths import resolve_landscape_dirs
 from .unet import UNet
-from .utils import get_device, tensor_to_hwc_uint8
+from .utils import get_device, ssim_value, tensor_to_hwc_uint8
 
 def _configure_torch_for_speed(*, enable_tf32: bool, enable_cudnn_benchmark: bool) -> None:
     if torch.cuda.is_available():
@@ -61,27 +62,70 @@ def _save_predictions_grid(x: torch.Tensor, y: torch.Tensor, pred: torch.Tensor,
 
 
 @torch.no_grad()
-def _eval_l1(
+def _eval_metrics(
     model: nn.Module,
     loader,
-    loss_fn: nn.Module,
     device: torch.device,
     *,
     use_amp: bool,
-) -> float:
+    loss_mode: str,
+    l1_weight: float,
+    ssim_weight: float,
+) -> dict[str, float]:
     model.eval()
-    total = 0.0
+    total_loss = 0.0
+    total_l1 = 0.0
+    total_ssim = 0.0
     count = 0
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=bool(use_amp) and device.type == "cuda"):
             pred = model(x)
-            loss = loss_fn(pred, y)
+            loss, l1, ssim = _compute_loss(
+                pred,
+                y,
+                loss_mode=loss_mode,
+                l1_weight=l1_weight,
+                ssim_weight=ssim_weight,
+            )
         bs = x.shape[0]
-        total += float(loss.item()) * bs
+        total_loss += float(loss.item()) * bs
+        total_l1 += float(l1.item()) * bs
+        total_ssim += float(ssim.item()) * bs
         count += bs
-    return total / max(count, 1)
+
+    denom = max(count, 1)
+    return {
+        "loss": total_loss / denom,
+        "l1": total_l1 / denom,
+        "ssim": total_ssim / denom,
+    }
+
+
+def _compute_loss(
+    pred: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    loss_mode: str,
+    l1_weight: float,
+    ssim_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    l1 = F.l1_loss(pred, y)
+    ssim = ssim_value(pred, y)
+    mode = loss_mode.lower()
+
+    if mode == "l1":
+        loss = l1
+    elif mode == "ssim":
+        loss = 1.0 - ssim
+    elif mode in {"l1+ssim", "l1_ssim", "l1ssim"}:
+        norm = max(float(l1_weight) + float(ssim_weight), 1e-8)
+        loss = (float(l1_weight) * l1 + float(ssim_weight) * (1.0 - ssim)) / norm
+    else:
+        raise ValueError(f"Unsupported loss_mode: {loss_mode}")
+
+    return loss, l1, ssim
 
 
 def train(
@@ -106,6 +150,9 @@ def train(
     predictions_subdir: str = "predictions_by_epoch",
     predictions_n_vis: int = 8,
     out_dir: str | Path = Path("outputs"),
+    loss_mode: str = "l1",
+    l1_weight: float = 0.8,
+    ssim_weight: float = 0.2,
 ) -> dict:
     root = Path(root)
     out_dir = Path(out_dir)
@@ -141,11 +188,21 @@ def train(
         except Exception as e:
             print("torch.compile unavailable/failed, continuing without compile:", repr(e))
 
-    loss_fn = nn.L1Loss()
+    mode = loss_mode.lower()
+    if mode not in {"l1", "ssim", "l1+ssim", "l1_ssim", "l1ssim"}:
+        raise ValueError("loss_mode must be one of: l1 | ssim | l1+ssim")
+
     optim = Adam(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler(device.type, enabled=bool(use_amp) and device.type == "cuda")
 
-    history: dict[str, list[float]] = {"train_l1": [], "test_l1": []}
+    history: dict[str, list[float]] = {
+        "train_loss": [],
+        "train_l1": [],
+        "train_ssim": [],
+        "test_loss": [],
+        "test_l1": [],
+        "test_ssim": [],
+    }
 
     best = float("inf")
     best_path = out_dir / "unet_best.pt"
@@ -154,7 +211,9 @@ def train(
 
     for epoch in range(1, epochs + 1):
         model.train()
-        running = 0.0
+        running_loss = 0.0
+        running_l1 = 0.0
+        running_ssim = 0.0
         seen = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
@@ -164,7 +223,13 @@ def train(
 
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=bool(use_amp) and device.type == "cuda"):
                 pred = model(x)
-                loss = loss_fn(pred, y)
+                loss, l1, ssim = _compute_loss(
+                    pred,
+                    y,
+                    loss_mode=mode,
+                    l1_weight=l1_weight,
+                    ssim_weight=ssim_weight,
+                )
 
             optim.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -172,19 +237,38 @@ def train(
             scaler.update()
 
             bs = x.shape[0]
-            running += float(loss.item()) * bs
+            running_loss += float(loss.item()) * bs
+            running_l1 += float(l1.item()) * bs
+            running_ssim += float(ssim.item()) * bs
             seen += bs
-            pbar.set_postfix(train_l1=running / max(seen, 1))
+            pbar.set_postfix(train_loss=running_loss / max(seen, 1), train_l1=running_l1 / max(seen, 1))
 
-        train_l1 = running / max(seen, 1)
-        test_l1 = (
-            _eval_l1(model, test_loader, loss_fn, device, use_amp=use_amp)
+        train_loss = running_loss / max(seen, 1)
+        train_l1 = running_l1 / max(seen, 1)
+        train_ssim = running_ssim / max(seen, 1)
+        test_metrics = (
+            _eval_metrics(
+                model,
+                test_loader,
+                device,
+                use_amp=use_amp,
+                loss_mode=mode,
+                l1_weight=l1_weight,
+                ssim_weight=ssim_weight,
+            )
             if len(test_loader.dataset)
-            else float("nan")
+            else {"loss": float("nan"), "l1": float("nan"), "ssim": float("nan")}
         )
+        test_loss = test_metrics["loss"]
+        test_l1 = test_metrics["l1"]
+        test_ssim = test_metrics["ssim"]
 
+        history["train_loss"].append(float(train_loss))
         history["train_l1"].append(float(train_l1))
+        history["train_ssim"].append(float(train_ssim))
+        history["test_loss"].append(float(test_loss))
         history["test_l1"].append(float(test_l1))
+        history["test_ssim"].append(float(test_ssim))
 
         torch.save(
             {
@@ -220,8 +304,8 @@ def train(
                     n_vis=predictions_n_vis,
                 )
 
-        if test_l1 == test_l1 and test_l1 < best:  # not NaN
-            best = test_l1
+        if test_loss == test_loss and test_loss < best:  # not NaN
+            best = test_loss
             torch.save(
                 {
                     "model": model.state_dict(),
@@ -245,6 +329,9 @@ def train(
         "epochs": epochs,
         "batch_size": batch_size,
         "lr": lr,
+        "loss_mode": mode,
+        "l1_weight": l1_weight,
+        "ssim_weight": ssim_weight,
         "history": history,
         "last_checkpoint": str(last_path),
         "best_checkpoint": str(best_path),
@@ -255,24 +342,43 @@ def train(
 
 
 def _save_loss_curve(history: dict[str, list[float]], path: Path) -> None:
+    train_loss = history.get("train_loss", [])
+    test_loss = history.get("test_loss", [])
     train_l1 = history.get("train_l1", [])
     test_l1 = history.get("test_l1", [])
-    if not train_l1:
+    train_ssim = history.get("train_ssim", [])
+    test_ssim = history.get("test_ssim", [])
+    if not train_loss:
         return
 
-    xs = list(range(1, len(train_l1) + 1))
-    plt.figure(figsize=(6, 4))
-    plt.plot(xs, train_l1, label="train_l1")
+    xs = list(range(1, len(train_loss) + 1))
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    axes[0].plot(xs, train_loss, label="train_loss")
+    if any(v == v for v in test_loss):
+        axes[0].plot(xs, test_loss, label="test_loss")
+    axes[0].set_xlabel("epoch")
+    axes[0].set_ylabel("objective")
+    axes[0].set_title("Training Objective")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    if train_l1:
+        axes[1].plot(xs, train_l1, label="train_l1")
     if any(v == v for v in test_l1):
-        plt.plot(xs, test_l1, label="test_l1")
-    plt.xlabel("epoch")
-    plt.ylabel("L1 (MAE)")
-    plt.title("Training Curve")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(path, dpi=150)
-    plt.close()
+        axes[1].plot(xs, test_l1, label="test_l1")
+    if train_ssim:
+        axes[1].plot(xs, train_ssim, label="train_ssim")
+    if any(v == v for v in test_ssim):
+        axes[1].plot(xs, test_ssim, label="test_ssim")
+    axes[1].set_xlabel("epoch")
+    axes[1].set_title("L1 / SSIM")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
 
 
 def main():
