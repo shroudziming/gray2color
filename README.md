@@ -6,7 +6,7 @@
 
 - 数据集读取：按文件名配对读取 `gray/` 与 `color/`（取交集）
 - 训练：保存 `outputs/unet_last.pt`、`outputs/unet_best.pt`、训练曲线与每个 epoch 的预测网格图
-- 评估：输出 MAE(L1) 与 PSNR，并保存预测效果 `outputs/predictions.png`
+- 评估：输出 Objective / MAE(L1) / SSIM / PSNR，并保存预测效果 `outputs/predictions.png`
 - 一键流程：训练 + 评估（见 `run_pipeline.py`）
 
 ## 目录约定（数据）
@@ -63,13 +63,14 @@ pip install torch numpy pillow matplotlib tqdm
 ### 1) 一键训练 + 评估
 
 ```bash
-python -m run_pipeline quick
+python -m run_pipeline quick l1
 # 或
-python -m run_pipeline full
+python -m run_pipeline full l1+ssim
 ```
 
 - `quick`：更少 epoch/图片数，适合验证环境与流程
 - `full`：更接近完整训练（默认 50 epochs，参数见 `run_pipeline.py`）
+- 第二个参数是训练/评估目标：`l1`、`ssim`、`l1+ssim`
 
 ### 2) 仅训练
 
