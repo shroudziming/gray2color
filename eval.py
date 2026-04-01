@@ -13,13 +13,33 @@ from torch.utils.data import DataLoader
 from .data import DatasetConfig, LandscapeColorizationDataset, make_splits
 from .paths import resolve_landscape_dirs
 from .unet import UNet
-from .utils import get_device, tensor_to_hwc_uint8
+from .utils import get_device, ssim_value, tensor_to_hwc_uint8
 
 @torch.no_grad()
 def psnr(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """PSNR for images in [0,1]. Returns per-batch scalar."""
     mse = torch.mean((pred - target) ** 2)
     return 10.0 * torch.log10(1.0 / (mse + eps))
+
+
+@torch.no_grad()
+def _objective_from_metrics(
+    l1: torch.Tensor,
+    ssim: torch.Tensor,
+    *,
+    loss_mode: str,
+    l1_weight: float,
+    ssim_weight: float,
+) -> torch.Tensor:
+    mode = loss_mode.lower()
+    if mode == "l1":
+        return l1
+    if mode == "ssim":
+        return 1.0 - ssim
+    if mode in {"l1+ssim", "l1_ssim", "l1ssim"}:
+        norm = max(float(l1_weight) + float(ssim_weight), 1e-8)
+        return (float(l1_weight) * l1 + float(ssim_weight) * (1.0 - ssim)) / norm
+    raise ValueError(f"Unsupported loss_mode: {loss_mode}")
 
 
 @torch.no_grad()
@@ -34,8 +54,11 @@ def evaluate(
     concat_input: bool = True,
     out_dir: str | Path = Path("outputs"),
     n_vis: int = 8,
-    vis_shuffle: bool = True,   # 是否打乱用于可视化的样本
-    vis_seed: int = 0,          # 换个 seed 就能换一批图
+    vis_shuffle: bool = True,   
+    vis_seed: int = 0,          
+    loss_mode: str = "l1",
+    l1_weight: float = 0.8,
+    ssim_weight: float = 0.2,
 ) -> dict:
     root = Path(root)
     checkpoint = Path(checkpoint)
@@ -70,9 +93,14 @@ def evaluate(
     model.load_state_dict(state)
     model.eval()
 
-    l1_fn = nn.L1Loss(reduction="mean")
+    mode = loss_mode.lower()
+    if mode not in {"l1", "ssim", "l1+ssim", "l1_ssim", "l1ssim"}:
+        raise ValueError("loss_mode must be one of: l1 | ssim | l1+ssim")
 
+    l1_fn = nn.L1Loss(reduction="mean")
+    total_obj = 0.0
     total_l1 = 0.0
+    total_ssim = 0.0
     total_psnr = 0.0
     count = 0
 
@@ -83,14 +111,26 @@ def evaluate(
         pred = model(x).clamp(0.0, 1.0)
 
         l1 = l1_fn(pred, y)
+        ssim = ssim_value(pred, y)
+        obj = _objective_from_metrics(
+            l1,
+            ssim,
+            loss_mode=mode,
+            l1_weight=l1_weight,
+            ssim_weight=ssim_weight,
+        )
         p = psnr(pred, y)
 
         bs = x.shape[0]
+        total_obj += float(obj.item()) * bs
         total_l1 += float(l1.item()) * bs
+        total_ssim += float(ssim.item()) * bs
         total_psnr += float(p.item()) * bs
         count += bs
 
+    avg_obj = total_obj / max(count, 1)
     avg_l1 = total_l1 / max(count, 1)
+    avg_ssim = total_ssim / max(count, 1)
     avg_psnr = total_psnr / max(count, 1)
 
     # 2) 可视化：单独用一个 loader，默认打乱，换 seed 就换图
@@ -125,8 +165,13 @@ def evaluate(
         "checkpoint": str(checkpoint),
         "device": str(device),
         "test_size": count,
+        "objective": avg_obj,
         "mae_l1": avg_l1,
+        "ssim": avg_ssim,
         "psnr": avg_psnr,
+        "loss_mode": mode,
+        "l1_weight": l1_weight,
+        "ssim_weight": ssim_weight,
         "predictions_png": str(vis_path),
         "vis_shuffle": vis_shuffle,
         "vis_seed": vis_seed,
@@ -175,7 +220,7 @@ def _save_visualization(vis_batches, path: Path, n_vis: int = 8) -> None:
 
 def main():
     m = evaluate()
-    print("MAE(L1):", m["mae_l1"], "PSNR:", m["psnr"])
+    print("Objective:", m["objective"], "MAE(L1):", m["mae_l1"], "SSIM:", m["ssim"], "PSNR:", m["psnr"])
     print("Saved:", m["predictions_png"])
 
 
